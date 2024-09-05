@@ -1,46 +1,47 @@
-package awsinterface
+package awsInterface
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/aws-sdk-go-v2/service/sso"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 )
 
 type AWSInterface struct {
-	lambdaClient *lambda.Client
-	stsClient    *sts.Client
-	currentRole  string
+	cfg           aws.Config
+	ssoClient     *sso.Client
+	ssooidcClient *ssooidc.Client
+	lambdaClient  *lambda.Client
+	ssoToken      string
+	tokenExpiry   time.Time
+	ssoStartURL   string
 }
 
-func NewAWSInterface() (*AWSInterface, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	return &AWSInterface{
-		lambdaClient: lambda.NewFromConfig(cfg),
-		stsClient:    sts.NewFromConfig(cfg),
-	}, nil
-}
-
-func (a *AWSInterface) AssumeRole(roleArn string) error {
-	provider := stscreds.NewAssumeRoleProvider(a.stsClient, roleArn)
+func NewAWSInterface(ssoProfileName string) (*AWSInterface, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(provider),
+		config.WithSharedConfigProfile(ssoProfileName),
 	)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to load AWS configuration: %v", err)
 	}
 
-	a.lambdaClient = lambda.NewFromConfig(cfg)
-	a.currentRole = roleArn
-	return nil
+	ssoClient := sso.NewFromConfig(cfg)
+	ssooidcClient := ssooidc.NewFromConfig(cfg)
+	lambdaClient := lambda.NewFromConfig(cfg)
+
+	awsInterface := &AWSInterface{
+		cfg:           cfg,
+		ssoClient:     ssoClient,
+		ssooidcClient: ssooidcClient,
+		lambdaClient:  lambdaClient,
+	}
+
+	return awsInterface, nil
 }
 
 func (a *AWSInterface) ListLambdaFunctions() ([]string, error) {
@@ -54,7 +55,7 @@ func (a *AWSInterface) ListLambdaFunctions() ([]string, error) {
 
 		result, err := a.lambdaClient.ListFunctions(context.TODO(), input)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list Lambda functions: %v", err)
 		}
 
 		for _, function := range result.Functions {
@@ -70,20 +71,15 @@ func (a *AWSInterface) ListLambdaFunctions() ([]string, error) {
 	return functionNames, nil
 }
 
-func (a *AWSInterface) InvokeLambda(functionName string, payload interface{}) ([]byte, error) {
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-
+func (a *AWSInterface) InvokeLambda(functionName string, payload []byte) ([]byte, error) {
 	input := &lambda.InvokeInput{
 		FunctionName: aws.String(functionName),
-		Payload:      jsonPayload,
+		Payload:      payload,
 	}
 
 	result, err := a.lambdaClient.Invoke(context.TODO(), input)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to invoke Lambda function: %v", err)
 	}
 
 	return result.Payload, nil
