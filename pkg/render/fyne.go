@@ -12,6 +12,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"image/color"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -33,49 +34,153 @@ func NewFyneRenderer(window fyne.Window, menuContainer *fyne.Container, contentC
 func (r *FyneRenderer) GenerateMenu() {
 	r.ClearScreen()
 
-	instructions := widget.NewLabel("Please enter your AWS SSO profile name.\n" +
-		"This should be configured in your AWS CLI (~/.aws/config).")
+	instructions := widget.NewLabel("Please enter your AWS SSO login portal URL.")
 
-	profileEntry := widget.NewEntry()
-	profileEntry.SetPlaceHolder("Enter AWS SSO Profile Name")
+	portalEntry := widget.NewEntry()
+	portalEntry.SetPlaceHolder("https://your-domain.awsapps.com/start")
 
 	statusLabel := widget.NewLabel("")
 
-	fetchLambdasButton := widget.NewButton("Fetch Lambda Functions", func() {
-		profileName := profileEntry.Text
-		var err error
-		r.awsInterface, err = awsinterface.NewAWSInterface(profileName)
-		if err != nil {
-			logger.Error("Failed to create AWS interface:", err)
-			statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+	var accountSelect *widget.Select
+	var roleSelect *widget.Select
+
+	loginButton := widget.NewButton("Login", func() {
+		portalURL := portalEntry.Text
+
+		if portalURL == "" {
+			statusLabel.SetText("Error: Portal URL is required")
 			return
 		}
 
-		statusLabel.SetText("AWS interface created successfully. Fetching Lambda functions...")
+		statusLabel.SetText("Initiating authentication...")
 
 		go func() {
-			lambdaFunctions, err := r.awsInterface.ListLambdaFunctions()
+			var err error
+			r.awsInterface, err = awsinterface.NewAWSInterface(portalURL)
 			if err != nil {
-				logger.Error("Failed to list Lambda functions:", err)
+				logger.Error("Failed to create AWS interface:", err)
 				r.window.Canvas().Refresh(statusLabel)
 				statusLabel.SetText(fmt.Sprintf("Error: %v", err))
 				return
 			}
-			r.window.Canvas().Refresh(statusLabel)
-			statusLabel.SetText(fmt.Sprintf("Successfully fetched %d Lambda functions", len(lambdaFunctions)))
-			r.GenerateLambdaContent(lambdaFunctions)
+
+			err = r.awsInterface.RegisterClient()
+			if err != nil {
+				logger.Error("Failed to register client:", err)
+				r.window.Canvas().Refresh(statusLabel)
+				statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+				return
+			}
+
+			authInfo, err := r.awsInterface.StartAuthentication()
+			if err != nil {
+				logger.Error("Failed to start authentication:", err)
+				r.window.Canvas().Refresh(statusLabel)
+				statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+				return
+			}
+
+			authInstructions := widget.NewLabel(fmt.Sprintf("Please visit this URL to complete authentication:\n%s\n\nAnd enter this code: %s", authInfo.VerificationURIComplete, authInfo.UserCode))
+			logger.Info(authInfo.VerificationURIComplete, authInfo.UserCode)
+
+			r.contentContainer.RemoveAll()
+			r.contentContainer.Add(authInstructions)
+			r.contentContainer.Refresh()
+
+			r.menuContainer.Hide()
+			r.contentContainer.Show()
+
+			go func() {
+				err := r.awsInterface.PollForToken(authInfo)
+				if err != nil {
+					logger.Error("Failed to complete authentication:", err)
+					r.window.Canvas().Refresh(statusLabel)
+					statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+					return
+				}
+
+				accounts, err := r.awsInterface.ListAccounts()
+				if err != nil {
+					logger.Error("Failed to list accounts:", err)
+					r.window.Canvas().Refresh(statusLabel)
+					statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+					return
+				}
+
+				accountOptions := make([]string, len(accounts))
+				for i, account := range accounts {
+					accountOptions[i] = fmt.Sprintf("%s (%s)", account.AccountName, account.AccountID)
+				}
+
+				accountSelect.Options = accountOptions
+				accountSelect.Refresh()
+				accountSelect.Show()
+
+				r.contentContainer.Hide()
+				r.menuContainer.Show()
+				r.window.Canvas().Refresh(statusLabel)
+				statusLabel.SetText("Authentication successful. Please select an account.")
+			}()
 		}()
 	})
 
-	calendarButton := widget.NewButton("Calendar", func() {
-		r.GenerateCalendarView()
+	var selectedAccountID string
+
+	accountSelect = widget.NewSelect([]string{}, func(value string) {
+		logger.Info("Account selected:", value)
+
+		accountID := strings.Split(value, "(")[1]
+		selectedAccountID = strings.TrimSuffix(accountID, ")")
+
+		roles, err := r.awsInterface.ListRoles(selectedAccountID)
+		if err != nil {
+			logger.Error("Failed to list roles:", err)
+			statusLabel.SetText(fmt.Sprintf("Error: Failed to list roles: %v", err))
+			return
+		}
+
+		roleOptions := make([]string, len(roles))
+		for i, role := range roles {
+			roleOptions[i] = role.RoleName
+		}
+
+		roleSelect.Options = roleOptions
+		roleSelect.Refresh()
+		roleSelect.Show()
+		statusLabel.SetText("Please select a role.")
 	})
+	accountSelect.Hide()
+
+	roleSelect = widget.NewSelect([]string{}, func(value string) {
+		logger.Info("Role selected:", value)
+		statusLabel.SetText("Assuming role...")
+
+		err := r.awsInterface.AssumeRole(selectedAccountID, value)
+		if err != nil {
+			logger.Error("Failed to assume role:", err)
+			statusLabel.SetText(fmt.Sprintf("Error: Failed to assume role: %v", err))
+			return
+		}
+
+		statusLabel.SetText("Role assumed successfully. Loading Lambda functions...")
+
+		lambdaFunctions, err := r.awsInterface.ListLambdaFunctions()
+		if err != nil {
+			logger.Error("Failed to list Lambda functions:", err)
+			statusLabel.SetText(fmt.Sprintf("Error: Failed to list Lambda functions: %v", err))
+			return
+		}
+
+		r.GenerateLambdaContent(lambdaFunctions)
+	})
+	roleSelect.Hide()
 
 	menuContent := container.NewVBox(
 		instructions,
-		profileEntry,
-		fetchLambdasButton,
-		calendarButton,
+		portalEntry,
+		loginButton,
+		accountSelect,
+		roleSelect,
 		statusLabel,
 	)
 
